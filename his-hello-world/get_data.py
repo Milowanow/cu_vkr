@@ -6,29 +6,35 @@ from urllib.parse import quote
 
 import requests
 
+#-------Логгирование--------------------
+from log_setup import setup_logging
+setup_logging()
+
+import logging
+logger = logging.getLogger("get_data")
+#---------------------------------------
+
 
 def load_credentials(cred_path: str) -> dict:
     """Загружает учётные данные из JSON-файла."""
     if not os.path.isfile(cred_path):
-        print(f"Ошибка: файл с учётными данными не найден: {cred_path}")
-        sys.exit(1)
+        raise FileNotFoundError(f"файл с учётными данными не найден: {cred_path}")
 
     try:
         with open(cred_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        print(f"Ошибка чтения {cred_path}: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Ошибка чтения {cred_path}: {e}")
 
     sftp = data.get("sftp")
     if not sftp:
         print(f"Ошибка: в {cred_path} отсутствует секция 'sftp'")
-        sys.exit(1)
+        raise ValueError(f"Ошибка: в {cred_path} отсутствует секция 'sftp'")
+        
 
     for key in ("url", "username", "password"):
         if not sftp.get(key):
-            print(f"Ошибка: в секции 'sftp' отсутствует поле '{key}'")
-            sys.exit(1)
+            raise ValueError(f"Ошибка: в секции 'sftp' отсутствует поле '{key}'")
 
     return sftp
 
@@ -42,14 +48,12 @@ def get_user_token(base_url: str, username: str, password: str) -> str:
         response.raise_for_status()
         token = response.json().get("access_token")
     except requests.exceptions.RequestException as e:
-        print(f"Ошибка при получении токена: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Ошибка при получении токена: {e}")
 
     if not token:
-        print("Ошибка: токен не найден в ответе сервера.")
-        sys.exit(1)
+        raise RuntimeError("Токен не найден в ответе сервера.")
 
-    print("Токен успешно получен.")
+    logger.debug("Токен успешно получен.")
     return token
 
 
@@ -68,8 +72,7 @@ def download_file(
     # 4. Локальное имя файла = имя файла из remote_path (без ведущего слэша)
     local_filename = os.path.basename(remote_path.rstrip("/"))
     if not local_filename:
-        print(f"Ошибка: не удалось определить имя файла из пути '{remote_path}'")
-        sys.exit(1)
+        raise ValueError(f"Ошибка: не удалось определить имя файла из пути '{remote_path}'")
 
     local_path = os.path.join(save_dir, local_filename) if save_dir else local_filename
 
@@ -81,7 +84,7 @@ def download_file(
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        print(f"Скачивание файла: {remote_path} -> {os.path.abspath(local_path)}")
+        logger.info(f"Скачивание файла: {remote_path} -> {os.path.abspath(local_path)}")
         with requests.get(
             download_url, headers=headers, stream=True, timeout=60
         ) as file_response:
@@ -92,15 +95,12 @@ def download_file(
                     if chunk:
                         f.write(chunk)
 
-        print(f"Файл успешно сохранён: {os.path.abspath(local_path)}")
+        logger.info(f"Файл успешно сохранён: {os.path.abspath(local_path)}")
 
     except requests.exceptions.RequestException as e:
-        print(f"Ошибка при скачивании файла: {e}")
-        sys.exit(1)
+        raise RuntimeError(f"Ошибка при скачивании файла: {e}")
     except IOError as e:
-        print(f"Ошибка при записи файла: {e}")
-        sys.exit(1)
-
+        raise RuntimeError(f"Ошибка при записи файла: {e}")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

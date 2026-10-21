@@ -6,6 +6,8 @@ import torch.utils.data as udata
 import h5py
 from PIL import Image
 
+from lazy_dataset import LazyDataset
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -27,96 +29,213 @@ def load_icvl_hsi_patch(path, top, left, ps):
     return np.asarray(patch, dtype=np.float32)
 
 
-def load_raw_patch(path, top, left, ps):
-    """
-    Читает только окно из PNG и возвращает (3, ps, ps) float32.
-    Соглашение осей: (C, W, H), поэтому кроп по (W, H).
-    """
-    img = Image.open(path)                         # ленивая загрузка
-    arr = np.asarray(img)                          # (H, W, 3)
-    arr = arr[left:left+ps, top:top+ps, :]         # (ps, ps, 3)
-    arr = np.transpose(arr, (2, 0, 1))             # (3, ps, ps)
+def load_rgb_patch(path, top, left, ps):
+    arr = np.load(path)                            # (H, W, 3) npy
+    arr = arr[left:left+ps, top:top+ps, :]
+    arr = np.transpose(arr, (2, 0, 1))
     return arr.astype(np.float32)
+
 
 # ----------------------------------------------------------------------
 # Датасет
 # ----------------------------------------------------------------------
-class ICVLDataset(udata.Dataset):
+class ICVLDataset(LazyDataset):
     """
-    Пары (RAW, HSI).
-    RAW (3, W, H)
-    HSI (C, W, H)
-    Ожидается, что имена файлов совпадают (без расширения) в двух директориях.
+        Пары (HSI .mat, RAW .npy).
+    
+        - file_list: удалённые пути на FTP, ['ICVL_our/4cam_0411-1640-1.mat', ...]
+        - hsi_local_dir: директория с ГСИ файлами
+        - rgb_local_dir: директория с RGB файлами
+
+        Патчи:
+        - patch_size=None  -> один сэмпл на файл (весь кадр);
+        - patch_size=N     -> патчи N×N со страйдом stride (по умолчанию N),
+                            включая гарантированный последний по каждой оси.
     """
     def __init__(self,
-                 raw_dir,
-                 hsi_dir,
-                 raw_ext='.png',
-                 train=True,
+                 file_list,
+                 hsi_local_dir='./downloaded/ICVL',
+                 rgb_local_dir='./rgb',
+                 rgb_ext='.npy',
                  patch_size=None,
+                 train=True,
                  stride=None,
-                 transform=None,          # для raw
-                 target_transform=None):  # для hsi
-        self.raw_dir = raw_dir
-        self.hsi_dir = hsi_dir
+                 transform=None,
+                 target_transform=None,
+                 project_dir="."):
+        logger.debug("Директория ГСИ: {hsi_local_dir}")
+        logger.debug("Директория RGB: {hsi_local_dir}")
+
+        self.hsi_local_dir = hsi_local_dir 
+        self.rgb_local_dir = rgb_local_dir
+        self.rgb_ext = rgb_ext
+        self.hsi_ext = ".mat"
         self.train = train
-        
+
+        #Патчи
         self.patch_size = patch_size
-        # если stride не задан — берём без перекрытия
-        self.stride = stride if stride is not None else patch_size
-        
+        if patch_size is None:
+            self.stride = None
+        else:
+            self.stride = stride if stride is not None else patch_size
+
+        #Трансфореры
         self.transform = transform
         self.target_transform = target_transform
+        self.project_dir = project_dir
 
-        self.pairs = self._build_pairs(raw_dir, hsi_dir, raw_ext)
-        self.patches = self._build_patches()
+        self.remote_paths = file_list
 
-        logger.info(f"[ICVLDataset] пар: {len(self.pairs)}, "
-                    f"патчей: {len(self.patches)}")
+        # items — список единиц работы датасета
+        self.items = self._build_items()
 
-    def __len__(self):
-        return len(self.patches)
+        logger.info(f"[ICVLDataset] файлов: {len(self.remote_paths)}, "
+                    f"записей: {len(self.items)}")
 
-    def __getitem__(self, index):
-        pair_idx, top, left = self.patches[index]
-        raw_path, hsi_path = self.pairs[pair_idx]
-        ps = self.patch_size
+    # ------------------------------------------------------------------
+    # пути
+    # ------------------------------------------------------------------
+    def _stem(self, remote_path: str) -> str:
+        """
+            Возвращает «чистое» имя файла без директорий и без расширения.
 
-        raw = load_raw_patch(raw_path, top, left, ps)         # (3, ps, ps)
-        hsi = load_icvl_hsi_patch(hsi_path, top, left, ps)    # (C, ps, ps)
+            Пример:
+                'ICVL_our/BGU_0522-1136.mat'  ->  'BGU_0522-1136'
+            """
+        return os.path.splitext(os.path.basename(remote_path))[0]
+
+    def _local_hsi_path(self, remote_path: str) -> str:
+        """
+            По удалённому пути к HSI на FTP возвращает локальный путь,
+            по которому этот .mat лежит (или должен лежать) после скачивания.
+
+            Пример:
+                remote: 'ICVL_our/BGU_0522-1136.mat' -> './downloaded/ICVL/BGU_0522-1136.mat'
+        """
+        return os.path.join(self.hsi_local_dir,
+                            self._stem(remote_path) + self.hsi_ext)
+
+    def _local_rgb_path(self, remote_path: str) -> str:
+        """
+            По удалённому пути к HSI возвращает локальный путь к соответствующему
+            RGB-файлу (.npy). RGB берётся по тому же stem, что и .mat.
+
+            Пример:
+                remote: 'ICVL_our/BGU_0522-1136.mat' -> './rgb/BGU_0522-1136.npy'
+        """
+        return os.path.join(self.rgb_local_dir,
+                            self._stem(remote_path) + self.rgb_ext)
+
+    # ------------------------------------------------------------------
+    # LazyDownloadDataset
+    # ------------------------------------------------------------------
+    def _required_files(self, idx):
+        """
+        Возвращает оба файла: .mat (HSI) и .npy (RGB).
+        База проверит наличие и докачает отсутствующие.
+        """
+        item = self.items[idx]
+        remote = self.remote_paths[item["file_idx"]]
+
+        hsi_local = self._local_hsi_path(remote)
+        rgb_local = self._local_rgb_path(remote)
+
+        rgb_remote = self._stem(remote) + self.rgb_ext
+
+        return [
+            (remote,     hsi_local),
+            (rgb_remote, rgb_local),
+        ]
+
+    def _load_sample(self, idx):
+        """
+            Читает и возвращает один сэмпл (rgb, hsi) для индекса idx.
+
+            Вызывается из LazyDownloadDataset.__getitem__ 
+
+            Что делает по шагам:
+            1. По idx достаёт record и удалённый путь к .mat.
+            2. Переводит удалённый путь в локальные пути:
+                - .mat (HSI)  -> ./downloaded/ICVL/<stem>.mat
+                - .npy (RGB)  -> ./rgb/<stem>.npy
+            3. Берёт окно patch_size×patch_size (сейчас top=left=0 —
+                заглушка под случай «один патч на файл»).
+            4. Читает из .npy RGB-патч (3, ps, ps) и из .mat HSI-патч (C, ps, ps).
+            5. Применяет transform / target_transform, если они заданы.
+            6. Возвращает пару (raw, hsi) — то, что увидит DataLoader.
+
+            Ожидаемые формы тензоров (до transform):
+                raw: (3, ps, ps) float32
+                hsi: (C, ps, ps) float32
+
+        """
+        item = self.items[idx]
+        remote = self.remote_paths[item["file_idx"]]
+
+        hsi_path = self._local_hsi_path(remote)
+        rgb_path = self._local_rgb_path(remote)
+
+        if self.patch_size is None:
+            # без патчей: читаем весь кадр. ps = размер кадра по каждой оси —
+            # берём из HSI-метаданных, чтобы не открывать .npy зря.
+            _, W, H = get_icvl_hsi_shape(hsi_path)
+            top, left, ps_w, ps_h = 0, 0, W, H
+            rgb = load_rgb_patch(rgb_path, top, left, ps_w)  # (3, W, H)
+            hsi = load_icvl_hsi_patch(hsi_path, top, left, ps_w)
+        else:
+            top  = item["top"]
+            left = item["left"]
+            ps   = self.patch_size
+            rgb  = load_rgb_patch(rgb_path, top, left, ps)
+            hsi  = load_icvl_hsi_patch(hsi_path, top, left, ps)
 
         if self.transform is not None:
-            raw = self.transform(raw)
+            rgb = self.transform(rgb)
         if self.target_transform is not None:
             hsi = self.target_transform(hsi)
+        return rgb, hsi
 
-        return raw, hsi
 
-    #
-    # helpers
-    #
-    def _build_pairs(self, raw_dir, hsi_dir, raw_ext):
-        """Собирает пары (raw_path, hsi_path) по совпадению stem имени."""
-        raw_paths = sorted(glob.glob(os.path.join(raw_dir, f'*{raw_ext}')))
-        pairs = []
-        for rp in raw_paths:
-            stem = os.path.splitext(os.path.basename(rp))[0]
-            hp = os.path.join(hsi_dir, stem + ".mat")
-            if os.path.exists(hp):
-                pairs.append((rp, hp))
-            else:
-                logger.warning(f"нет пары для {rp}")
-
-        if not pairs:
-            raise RuntimeError("Не найдено ни одной пары RAW-HSI!")
-        return pairs
-
-    def _build_patches(self):
+    def _build_items(self):
         """
-        Строит плоский список (pair_idx, top, left) для всех патчей.
-        Размеры (W, H) берутся из метаданных первого .mat, без чтения данных.
+            Строит self.items — плоский список «единиц работы» датасета.
+            len(self.items) == len(self), поэтому DataLoader индексирует именно его.
+
+            items — это лёгкие словари-адреса, а не данные. Каждый элемент говорит,
+            ЧТО прочитать для сэмпла с данным idx, но не читает это сам:
+                - {"file_idx": k}              — весь k-й файл (патчи выключены);
+                - {"file_idx": k, "top": t, "left": l}    — окно patch_size×patch_size в k-м файле на позиции (t, l).
+
+            Поведение зависит от self.patch_size:
+
+            Раскладка патчей:
+                tops  = _axis_offsets(W, ps, st)  — начала окон по первой оси;
+                lefts = _axis_offsets(H, ps, st)  — по второй.
+
+            Возвращаемое значение:
+                Список словарей. Для каждого файла i и каждой пары (top, left)
+                из tops×lefts — один элемент. Порядок детерминированный:
+                сначала все патчи файла 0, затем файла 1 и т.д.
+                Это позволяет воспроизводимо перемешивать индексы и,
+                при желании, строить срезы вроде «только первые патчи каждого файла».
+
+            Пример:
+                files = 3, W=H=512, ps=64, st=64
+                -> tops = lefts = [0, 64, ..., 448]  (8 значений)
+                -> len(items) = 3 * 8 * 8 = 192 сэмпла.
         """
-        _, W, H = get_icvl_hsi_shape(self.pairs[0][1])
+        if self.patch_size is None:
+            # один сэмпл на файл
+            return [{"file_idx": i} for i in range(len(self.remote_paths))]
+
+        # для патчей нужны размеры куба: скачиваем метаданные первого файла.
+        # Это единственное место, где мы «трогаем» файл в __init__.
+        from pathlib import Path
+        first_remote = self.remote_paths[0]
+        first_local = Path(self._local_hsi_path(first_remote))
+        self._ensure_local(first_remote, first_local)
+
+        _, W, H = get_icvl_hsi_shape(str(first_local))
         ps, st = self.patch_size, self.stride
         self._check_image_size(W, H, ps)
 
@@ -124,10 +243,10 @@ class ICVLDataset(udata.Dataset):
         lefts = self._axis_offsets(H, ps, st)
 
         return [
-            (pair_idx, top, left)
-            for pair_idx in range(len(self.pairs))
-            for top in tops
-            for left in lefts
+            {"file_idx": i, "top": t, "left": l}
+            for i in range(len(self.remote_paths))
+            for t in tops
+            for l in lefts
         ]
 
     @staticmethod

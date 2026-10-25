@@ -32,8 +32,10 @@ os.environ["AWS_SECRET_ACCESS_KEY"] = "minio_secret"
 CHECKPOINT_DIR = "./checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-tracking_uri = f"http://localhost:{5000}"
+#tracking_uri = f"http://localhost:{5000}"
+tracking_uri = "sqlite:///mlflow.db"
 mlflow.set_tracking_uri(tracking_uri)
+
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 logger.info(f"device:, {device}")

@@ -55,11 +55,23 @@ rgb_transform = transforms.Compose([
     transforms.Lambda(normalize_rgb),
 ])
 
-file_list = [
-    "ICVL_our/4cam_0411-1640-1.mat",
-    "ICVL_our/4cam_0411-1648.mat",
-    "ICVL_our/BGU_0403-1419-1.mat",
-]
+
+def read_lines_from_file(filename: str) -> list[str]:
+    """
+    Читает текстовый файл и возвращает список строк (без символов перевода строки).
+    
+    Args:
+        filename: путь к текстовому файлу.
+    
+    Returns:
+        Список строк из файла.
+    """
+    with open(filename, "r", encoding="utf-8") as f:
+        # strip() убирает '\n' и '\r' в конце строки
+        return [line.strip() for line in f if line.strip()]
+    
+file_list = read_lines_from_file("ICVL_our_files.txt")
+logger.info(f"Dataset ICVL: {len(file_list)} файлов")
 
 train_ds = ICVLDataset(
     file_list=file_list,

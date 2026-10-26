@@ -23,7 +23,13 @@ logging.getLogger("botocore").setLevel(logging.WARNING)
 logging.getLogger("boto3").setLevel(logging.WARNING)
 logging.getLogger("s3transfer").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-#
+
+
+from memory_logger import start_memory_monitor
+#----------------------------------------------------------------------------
+
+
+
 
 os.environ["MLFLOW_S3_ENDPOINT_URL"] = "http://localhost:9000"
 os.environ["AWS_ACCESS_KEY_ID"] = "minio_access"
@@ -109,6 +115,8 @@ if RESUME_CHECKPOINT_PATH and os.path.exists(RESUME_CHECKPOINT_PATH):
 # ==========================================
 # Открываем run. Если возобновляем — используем тот же run_id, чтобы графики
 # продолжились, а не начались с нуля.
+start_memory_monitor()
+
 with mlflow.start_run(run_id=RESUME_RUN_ID) as run:
     run_id = run.info.run_id
     logger.info(f"MLflow Run ID: {run_id}")

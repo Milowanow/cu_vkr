@@ -1,4 +1,11 @@
 import logging.config
+from pathlib import Path
+
+# Папка для логов рядом со скриптом (или можно взять из env)
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "app.log"
+
 
 LOGGING = {
     "version": 1,
@@ -20,10 +27,11 @@ LOGGING = {
             "class": "logging.handlers.RotatingFileHandler",
             "formatter": "standard",
             "level": "DEBUG",
-            "filename": "app.log",
+            "filename": str(LOG_FILE),
             "maxBytes": 5_000_000,
             "backupCount": 3,
             "encoding": "utf-8",
+            "delay": True,
         },
     },
     "loggers": {

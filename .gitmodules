@@ -1,0 +1,3 @@
+[submodule "hsi-rec/MST-plus-plus"]
+	path = hsi-rec/MST-plus-plus
+	url = https://github.com/caiyuanhao1998/MST-plus-plus.git
